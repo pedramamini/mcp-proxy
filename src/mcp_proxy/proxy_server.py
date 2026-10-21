@@ -8,6 +8,7 @@ import typing as t
 
 from mcp import server, types
 from mcp.client.session import ClientSession
+from mcp.server.lowlevel.server import request_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +20,17 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
     capabilities = response.capabilities
 
     logger.debug("Configuring proxied MCP server...")
-    app: server.Server[object] = server.Server(name=response.serverInfo.name)
+    app: server.Server[object] = server.Server(
+        name=response.serverInfo.name,
+        version=response.serverInfo.version,
+        instructions=response.instructions,
+    )
 
     if capabilities.prompts:
         logger.debug("Capabilities: adding Prompts...")
 
-        async def _list_prompts(_: t.Any) -> types.ServerResult:  # noqa: ANN401
-            result = await remote_app.list_prompts()
+        async def _list_prompts(req: types.ListPromptsRequest) -> types.ServerResult:
+            result = await remote_app.list_prompts(params=req.params)
             return types.ServerResult(result)
 
         app.request_handlers[types.ListPromptsRequest] = _list_prompts
@@ -39,14 +44,16 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
     if capabilities.resources:
         logger.debug("Capabilities: adding Resources...")
 
-        async def _list_resources(_: t.Any) -> types.ServerResult:  # noqa: ANN401
-            result = await remote_app.list_resources()
+        async def _list_resources(req: types.ListResourcesRequest) -> types.ServerResult:
+            result = await remote_app.list_resources(params=req.params)
             return types.ServerResult(result)
 
         app.request_handlers[types.ListResourcesRequest] = _list_resources
 
-        async def _list_resource_templates(_: t.Any) -> types.ServerResult:  # noqa: ANN401
-            result = await remote_app.list_resource_templates()
+        async def _list_resource_templates(
+            req: types.ListResourceTemplatesRequest,
+        ) -> types.ServerResult:
+            result = await remote_app.list_resource_templates(params=req.params)
             return types.ServerResult(result)
 
         app.request_handlers[types.ListResourceTemplatesRequest] = _list_resource_templates
@@ -84,17 +91,51 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
     if capabilities.tools:
         logger.debug("Capabilities: adding Tools...")
 
-        async def _list_tools(_: t.Any) -> types.ServerResult:  # noqa: ANN401
-            tools = await remote_app.list_tools()
+        async def _list_tools(req: t.Any) -> types.ServerResult:  # noqa: ANN401
+            tools = await remote_app.list_tools(
+                params=req.params if req is not None else None,
+            )
             return types.ServerResult(tools)
 
         app.request_handlers[types.ListToolsRequest] = _list_tools
 
         async def _call_tool(req: types.CallToolRequest) -> types.ServerResult:
             try:
+                # Convert meta to dict if present (required for TypedDict compatibility)
+                meta_dict = dict(req.params.meta) if req.params.meta else None
+
+                # Only set up progress forwarding if progressToken is present
+                progress_token = meta_dict.get("progressToken") if meta_dict else None
+                progress_callback = None
+
+                if progress_token is not None:
+                    # Get request context to access server session for progress forwarding
+                    ctx = request_ctx.get()
+
+                    # Create progress forwarder callback
+                    # Note: The callback receives individual parameters, not a
+                    # ProgressNotificationParams object
+                    async def progress_forwarder(
+                        progress: float,
+                        total: float | None,
+                        message: str | None,
+                    ) -> None:
+                        # Forward progress notification back to parent via server session
+                        await ctx.session.send_progress_notification(
+                            progress_token=progress_token,
+                            progress=progress,
+                            total=total,
+                            message=message,
+                            related_request_id=str(ctx.request_id),
+                        )
+
+                    progress_callback = progress_forwarder
+
                 result = await remote_app.call_tool(
                     req.params.name,
                     (req.params.arguments or {}),
+                    meta=meta_dict,
+                    progress_callback=progress_callback,
                 )
                 return types.ServerResult(result)
             except Exception as e:  # noqa: BLE001
@@ -120,6 +161,7 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
         result = await remote_app.complete(
             req.params.ref,
             req.params.argument.model_dump(),
+            context_arguments=req.params.context.arguments if req.params.context else None,
         )
         return types.ServerResult(result)
 

@@ -2,11 +2,13 @@
 
 import contextlib
 import logging
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+import sys
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
+import anyio
 import uvicorn
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -25,6 +27,12 @@ from .proxy_server import create_proxy_server
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_EXPOSE_HEADERS: Final[tuple[str, ...]] = ("mcp-session-id",)
+
+
+def _default_expose_headers() -> list[str]:
+    return list(DEFAULT_EXPOSE_HEADERS)
+
 
 @dataclass
 class MCPServerSettings:
@@ -34,12 +42,14 @@ class MCPServerSettings:
     port: int
     stateless: bool = False
     allow_origins: list[str] | None = None
+    expose_headers: list[str] = field(default_factory=_default_expose_headers)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
 
 # To store last activity for multiple servers if needed, though status endpoint is global for now.
 _global_status: dict[str, Any] = {
     "api_last_activity": datetime.now(timezone.utc).isoformat(),
+    "active_sse_connections": 0,
     "server_instances": {},  # Could be used to store per-instance status later
 }
 
@@ -48,9 +58,27 @@ def _update_global_activity() -> None:
     _global_status["api_last_activity"] = datetime.now(timezone.utc).isoformat()
 
 
+class _ASGIEndpointAdapter:
+    """Wrap a coroutine function into an ASGI application."""
+
+    def __init__(self, endpoint: Callable[[Scope, Receive, Send], Awaitable[None]]) -> None:
+        self._endpoint = endpoint
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await self._endpoint(scope, receive, send)
+
+
+HTTP_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"]
+
+
 async def _handle_status(_: Request) -> Response:
     """Global health check and service usage monitoring endpoint."""
     return JSONResponse(_global_status)
+
+
+async def _handle_healthz(_: Request) -> Response:
+    """Respond to a transport liveness probe without allocating an MCP session."""
+    return Response(status_code=204)
 
 
 def create_single_instance_routes(
@@ -72,29 +100,122 @@ def create_single_instance_routes(
         stateless=stateless_instance,
     )
 
-    async def handle_sse_instance(request: Request) -> None:
-        async with sse_transport.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,  # noqa: SLF001
-        ) as (read_stream, write_stream):
-            _update_global_activity()
-            await mcp_server_instance.run(
-                read_stream,
-                write_stream,
-                mcp_server_instance.create_initialization_options(),
+    async def handle_sse_instance(request: Request) -> Response:
+        try:
+            async with sse_transport.connect_sse(
+                request.scope,
+                request.receive,
+                request._send,  # noqa: SLF001
+            ) as (read_stream, write_stream):
+                _update_global_activity()
+                _global_status["active_sse_connections"] += 1
+                try:
+                    await mcp_server_instance.run(
+                        read_stream,
+                        write_stream,
+                        mcp_server_instance.create_initialization_options(),
+                        stateless=stateless_instance,
+                    )
+                finally:
+                    _global_status["active_sse_connections"] -= 1
+        except Exception:  # noqa: BLE001
+            # SSE response already started — cannot send HTTP error response.
+            # Log and let the connection close gracefully.
+            logger.warning(
+                "SSE connection for '%s' terminated with error (upstream disconnect?)",
+                mcp_server_instance.name,
+                exc_info=True,
             )
+        return Response()
 
     async def handle_streamable_http_instance(scope: Scope, receive: Receive, send: Send) -> None:
         _update_global_activity()
-        await http_session_manager.handle_request(scope, receive, send)
+        updated_scope = scope
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if path and path.rstrip("/") == "/mcp" and not path.endswith("/"):
+                updated_scope = dict(scope)
+                normalized_path = path + "/"
+                logger.debug(
+                    "Normalized request path from '%s' to '%s' without redirect",
+                    path,
+                    normalized_path,
+                )
+                updated_scope["path"] = normalized_path
+
+                raw_path = scope.get("raw_path")
+                if raw_path:
+                    if b"?" in raw_path:
+                        path_part, query_part = raw_path.split(b"?", 1)
+                        updated_scope["raw_path"] = path_part.rstrip(b"/") + b"/?" + query_part
+                    else:
+                        updated_scope["raw_path"] = raw_path.rstrip(b"/") + b"/"
+
+        await http_session_manager.handle_request(updated_scope, receive, send)
 
     routes = [
+        Route("/healthz", endpoint=_handle_healthz, methods=["GET", "HEAD"]),
+        Route(
+            "/mcp",
+            endpoint=_ASGIEndpointAdapter(handle_streamable_http_instance),
+            methods=HTTP_METHODS,
+            include_in_schema=False,
+        ),
         Mount("/mcp", app=handle_streamable_http_instance),
         Route("/sse", endpoint=handle_sse_instance),
         Mount("/messages/", app=sse_transport.handle_post_message),
     ]
     return routes, http_session_manager
+
+
+class _StdioExitWatch:
+    """Stop the proxy when a stdio server exits, so it exits non-zero and can be restarted."""
+
+    def __init__(self) -> None:
+        self.http_server: uvicorn.Server | None = None
+        self.exited: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def client(
+        self, params: StdioServerParameters, name: str
+    ) -> AsyncIterator[tuple[Any, Any]]:
+        """Like stdio_client, but notice when the server's stdout closes."""
+        async with stdio_client(params) as (read_stream, write_stream):
+            send, receive = anyio.create_memory_object_stream[Any](0)
+
+            async def forward() -> None:
+                async with send:
+                    try:
+                        async for message in read_stream:
+                            await send.send(message)
+                    except anyio.BrokenResourceError:
+                        return  # the session stopped reading: we are shutting down
+                self._on_exit(name)
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(forward)
+                yield receive, write_stream
+                tg.cancel_scope.cancel()
+
+    def _on_exit(self, name: str) -> None:
+        if self.http_server is not None and self.http_server.should_exit:
+            return  # already shutting down (e.g. Ctrl+C), which stops the stdio server too
+        logger.error("Stdio server '%s' exited, shutting down", name)
+        self.exited.append(name)
+        if self.http_server is not None:
+            self.http_server.should_exit = True
+            # Don't let a client's open connection keep a proxy with a dead server running.
+            self.http_server.config.timeout_graceful_shutdown = 5
+
+    def attach(self, http_server: uvicorn.Server) -> None:
+        """Stop this server when a stdio server exits, or right away if one already has."""
+        self.http_server = http_server
+        http_server.should_exit = bool(self.exited)
+
+    def exit_if_exited(self) -> None:
+        """Exit non-zero if a stdio server exited, so a supervisor restarts the proxy."""
+        if self.exited:
+            sys.exit(1)
 
 
 async def run_mcp_server(
@@ -106,6 +227,7 @@ async def run_mcp_server(
     if named_server_params is None:
         named_server_params = {}
 
+    stdio_exit = _StdioExitWatch()
     all_routes: list[BaseRoute] = [
         Route("/status", endpoint=_handle_status),  # Global status endpoint
     ]
@@ -126,7 +248,9 @@ async def run_mcp_server(
                 default_server_params.command,
                 " ".join(default_server_params.args),
             )
-            stdio_streams = await stack.enter_async_context(stdio_client(default_server_params))
+            stdio_streams = await stack.enter_async_context(
+                stdio_exit.client(default_server_params, "default"),
+            )
             session = await stack.enter_async_context(ClientSession(*stdio_streams))
             proxy = await create_proxy_server(session)
 
@@ -146,7 +270,7 @@ async def run_mcp_server(
                 params.command,
                 " ".join(params.args),
             )
-            stdio_streams_named = await stack.enter_async_context(stdio_client(params))
+            stdio_streams_named = await stack.enter_async_context(stdio_exit.client(params, name))
             session_named = await stack.enter_async_context(ClientSession(*stdio_streams_named))
             proxy_named = await create_proxy_server(session_named)
 
@@ -175,6 +299,7 @@ async def run_mcp_server(
                     allow_origins=mcp_settings.allow_origins,
                     allow_methods=["*"],
                     allow_headers=["*"],
+                    expose_headers=mcp_settings.expose_headers,
                 ),
             )
 
@@ -185,6 +310,8 @@ async def run_mcp_server(
             lifespan=combined_lifespan,
         )
 
+        starlette_app.router.redirect_slashes = False
+
         config = uvicorn.Config(
             starlette_app,
             host=mcp_settings.bind_host,
@@ -192,6 +319,7 @@ async def run_mcp_server(
             log_level=mcp_settings.log_level.lower(),
         )
         http_server = uvicorn.Server(config)
+        stdio_exit.attach(http_server)
 
         # Print out the SSE URLs for all configured servers
         base_url = f"http://{mcp_settings.bind_host}:{mcp_settings.port}"
@@ -217,3 +345,5 @@ async def run_mcp_server(
             mcp_settings.port,
         )
         await http_server.serve()
+
+    stdio_exit.exit_if_exited()

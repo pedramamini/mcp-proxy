@@ -14,11 +14,14 @@ import os
 import shlex
 import sys
 import typing as t
+from importlib.metadata import version
 
+from httpx import Auth, BasicAuth, DigestAuth
+from httpx_auth import OAuth2ClientCredentials
 from mcp.client.stdio import StdioServerParameters
 
 from .config_loader import load_named_server_configs_from_file
-from .mcp_server import MCPServerSettings, run_mcp_server
+from .mcp_server import DEFAULT_EXPOSE_HEADERS, MCPServerSettings, run_mcp_server
 from .sse_client import run_sse_client
 from .streamablehttp_client import run_streamablehttp_client
 
@@ -29,6 +32,20 @@ SSE_URL: t.Final[str | None] = os.getenv(
 )
 
 
+def _normalize_verify_ssl(value: str | bool | None) -> bool | str | None:
+    """Normalize the verify_ssl argument into bool, str path, or None."""
+    if isinstance(value, bool) or value is None:
+        return value
+
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+
+    return value
+
+
 def _setup_argument_parser() -> argparse.ArgumentParser:
     """Set up and return the argument parser for the MCP proxy."""
     parser = argparse.ArgumentParser(
@@ -36,7 +53,10 @@ def _setup_argument_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  mcp-proxy http://localhost:8080/sse\n"
+            "  mcp-proxy --no-verify-ssl https://server.local/sse\n"
             "  mcp-proxy --transport streamablehttp http://localhost:8080/mcp\n"
+            "  mcp-proxy --transport streamablehttp --username user --password pass "
+            "https://server.local/mcp\n"
             "  mcp-proxy --headers Authorization 'Bearer YOUR_TOKEN' http://localhost:8080/sse\n"
             "  mcp-proxy --port 8080 -- your-command --arg1 value1 --arg2 value2\n"
             "  mcp-proxy --named-server fetch 'uvx mcp-server-fetch' --port 8080\n"
@@ -52,6 +72,18 @@ def _setup_argument_parser() -> argparse.ArgumentParser:
 
 def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
     """Add all arguments to the argument parser."""
+    try:
+        package_version = version("mcp-proxy")
+    except Exception:  # noqa: BLE001
+        package_version = "unknown"
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {package_version}",
+        help="Show the version and exit",
+    )
+
     parser.add_argument(
         "command_or_url",
         help=(
@@ -80,6 +112,55 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
         choices=["sse", "streamablehttp"],
         default="sse",  # For backwards compatibility
         help="The transport to use for the client. Default is SSE.",
+    )
+    client_group.add_argument(
+        "--client-id",
+        type=str,
+        help="OAuth2 client ID for authentication",
+    )
+    client_group.add_argument(
+        "--client-secret",
+        type=str,
+        help="OAuth2 client secret for authentication",
+    )
+    client_group.add_argument(
+        "--token-url",
+        type=str,
+        help="OAuth2 token URL for authentication",
+    )
+    client_group.add_argument(
+        "--username",
+        type=str,
+        help="Username for authentication",
+    )
+    client_group.add_argument(
+        "--password",
+        type=str,
+        help="Password for authentication",
+    )
+    client_group.add_argument(
+        "--digest",
+        action="store_true",
+        help="Use digest authentication",
+    )
+    client_group.add_argument(
+        "--verify-ssl",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="VALUE",
+        dest="verify_ssl",
+        help=(
+            "Control SSL verification when acting as a client. Use without a value to "
+            "force verification, pass 'false' to disable, or provide a path to a PEM bundle."
+        ),
+    )
+    client_group.add_argument(
+        "--no-verify-ssl",
+        dest="verify_ssl",
+        action="store_const",
+        const=False,
+        help=("Disable SSL verification (alias for --verify-ssl false)."),
     )
 
     stdio_client_options = parser.add_argument_group("stdio client options")
@@ -119,9 +200,20 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
         default=False,
     )
     stdio_client_options.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        metavar="LEVEL",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the log level. Default is INFO.",
+    )
+    stdio_client_options.add_argument(
         "--debug",
         action=argparse.BooleanOptionalAction,
-        help="Enable debug mode with detailed logging output.",
+        help=(
+            "Enable debug mode with detailed logging output. Equivalent to --log-level DEBUG. "
+            "If both --debug and --log-level are provided, --debug takes precedence."
+        ),
         default=False,
     )
     stdio_client_options.add_argument(
@@ -188,12 +280,23 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
             "Default is no CORS allowed."
         ),
     )
+    mcp_server_group.add_argument(
+        "--expose-header",
+        action="append",
+        dest="expose_headers",
+        metavar="HEADER",
+        default=None,
+        help=(
+            "Headers to expose via Access-Control-Expose-Headers. "
+            "Defaults to 'Mcp-Session-Id'. Can be used multiple times."
+        ),
+    )
 
 
-def _setup_logging(*, debug: bool) -> logging.Logger:
+def _setup_logging(*, level: str, debug: bool) -> logging.Logger:
     """Set up logging configuration and return the logger."""
     logging.basicConfig(
-        level=logging.DEBUG if debug else logging.INFO,
+        level=logging.DEBUG if debug else level,
         format="[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s] %(message)s",
     )
     return logging.getLogger(__name__)
@@ -202,6 +305,7 @@ def _setup_logging(*, debug: bool) -> logging.Logger:
 def _handle_sse_client_mode(
     args_parsed: argparse.Namespace,
     logger: logging.Logger,
+    verify_ssl: bool | str | None = None,
 ) -> None:
     """Handle SSE/StreamableHTTP client mode operation."""
     if args_parsed.named_server_definitions:
@@ -215,10 +319,47 @@ def _handle_sse_client_mode(
     if api_access_token := os.getenv("API_ACCESS_TOKEN", None):
         headers["Authorization"] = f"Bearer {api_access_token}"
 
-    if args_parsed.transport == "streamablehttp":
-        asyncio.run(run_streamablehttp_client(args_parsed.command_or_url, headers=headers))
+    # Collect client credentials if provided
+    client_id = args_parsed.client_id
+    client_secret = args_parsed.client_secret
+    token_url = args_parsed.token_url
+    username = args_parsed.username
+    password = args_parsed.password
+    digest = args_parsed.digest
+
+    auth: Auth | None = None
+    if client_id and client_secret and token_url:
+        auth = OAuth2ClientCredentials(
+            client_id=client_id,
+            client_secret=client_secret,
+            token_url=token_url,
+        )
+    elif username and password:
+        auth = DigestAuth(username, password) if digest else BasicAuth(username, password)
+    elif username or password or digest:
+        logger.error("Both --username and --password are required")
+        sys.exit(1)
     else:
-        asyncio.run(run_sse_client(args_parsed.command_or_url, headers=headers))
+        auth = None
+
+    if args_parsed.transport == "streamablehttp":
+        asyncio.run(
+            run_streamablehttp_client(
+                args_parsed.command_or_url,
+                headers=headers,
+                auth=auth,
+                verify_ssl=verify_ssl,
+            ),
+        )
+    else:
+        asyncio.run(
+            run_sse_client(
+                args_parsed.command_or_url,
+                headers=headers,
+                auth=auth,
+                verify_ssl=verify_ssl,
+            ),
+        )
 
 
 def _configure_default_server(
@@ -240,7 +381,7 @@ def _configure_default_server(
         command=args_parsed.command_or_url,
         args=args_parsed.args,
         env=default_server_env,
-        cwd=args_parsed.cwd if args_parsed.cwd else None,
+        cwd=args_parsed.cwd or None,
     )
     logger.info(
         "Configured default server: %s %s",
@@ -316,12 +457,18 @@ def _configure_named_servers_from_cli(
 
 def _create_mcp_settings(args_parsed: argparse.Namespace) -> MCPServerSettings:
     """Create MCP server settings from parsed arguments."""
+    expose_headers = (
+        list(DEFAULT_EXPOSE_HEADERS)
+        if not args_parsed.expose_headers
+        else list(args_parsed.expose_headers)
+    )
     return MCPServerSettings(
         bind_host=args_parsed.host if args_parsed.host is not None else args_parsed.sse_host,
         port=args_parsed.port if args_parsed.port is not None else args_parsed.sse_port,
         stateless=args_parsed.stateless,
         allow_origins=args_parsed.allow_origin if len(args_parsed.allow_origin) > 0 else None,
-        log_level="DEBUG" if args_parsed.debug else "INFO",
+        expose_headers=expose_headers,
+        log_level="DEBUG" if args_parsed.debug else args_parsed.log_level,
     )
 
 
@@ -329,7 +476,7 @@ def main() -> None:
     """Start the client using asyncio."""
     parser = _setup_argument_parser()
     args_parsed = parser.parse_args()
-    logger = _setup_logging(debug=args_parsed.debug)
+    logger = _setup_logging(level=args_parsed.log_level, debug=args_parsed.debug)
 
     # Validate required arguments
     if (
@@ -348,7 +495,8 @@ def main() -> None:
     if args_parsed.command_or_url and args_parsed.command_or_url.startswith(
         ("http://", "https://"),
     ):
-        _handle_sse_client_mode(args_parsed, logger)
+        verify_ssl = _normalize_verify_ssl(getattr(args_parsed, "verify_ssl", None))
+        _handle_sse_client_mode(args_parsed, logger, verify_ssl=verify_ssl)
         return
 
     # Start stdio client(s) and expose as an SSE server
