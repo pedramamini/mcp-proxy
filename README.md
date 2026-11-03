@@ -53,6 +53,10 @@ graph LR
 
 This mode requires providing the URL of the MCP Server's SSE endpoint as the program’s first argument. If the server uses Streamable HTTP transport, make sure to enforce it on the `mcp-proxy` side by passing `--transport=streamablehttp`.
 
+When the proxy is a **Streamable HTTP client**, it bounds the final MCP session-termination `DELETE` request, including reading its response body, to five seconds. After cancellation or timeout, closing a received response gets a shielded, cooperative grace of up to one second; cleanup code that ignores cancellation can take longer. Graceful CLI teardown after SIGINT requires Python 3.11+; on Python 3.10, SIGINT may interrupt the event loop before the final `DELETE` is sent ([asyncio runner documentation](https://docs.python.org/3.11/library/asyncio-runner.html#handling-keyboard-interruption)). This limit applies only to that termination operation; normal `GET` streams and `POST` tool calls retain their usual HTTP timeouts. It is specific to reverse-client mode and does not change the stateful/stateless behavior of proxied HTTP servers.
+
+In reverse Streamable HTTP mode, an HTTP `404` on a `POST` for an established upstream session marks that session lost. The operation that received the `404` is never retried; its failure follows the existing proxy handling, and the server may already have applied it. A later explicit request may use a replacement session only when its complete initialization handshake matches the original. The proxy does not restore subscriptions, logging levels, or other upstream session-local state; after stateful resource or logging operations, or when the handshake changes, it refuses later requests and the MCP client must restart. Progress notifications are sent only to the current healthy session and are not buffered or replayed.
+
 Arguments
 
 | Name             | Required | Description                                                                                                       | Example                                       |
@@ -95,6 +99,16 @@ For Claude Desktop, the configuration entry can look like this:
 }
 ```
 
+Closing the client's stdin disconnects the remote session and cancels connection setup, initialization, and active
+requests. Queued input is abandoned. Each input frame is limited to 4 MiB of UTF-8 wire payload bytes, excluding
+CR/LF delimiters. At most 4 MiB and 128 frames may be admitted but not yet consumed; empty and malformed frames count
+toward the frame limit. Exceeding either limit exits with an error instead of silently dropping input. These are
+admission limits, not an exact memory limit, because decoded text and protocol objects use additional memory.
+
+The client must read or close stdout. A full, unread stdout pipe can prevent process exit. A cancelled blocking stdin
+read may leave one daemon thread and its private descriptor until the read returns or the process exits. The helper
+supports one active CLI lifespan per process.
+
 ## 2. SSE to stdio
 
 Run a proxy server exposing a SSE server that connects to a local stdio server.
@@ -132,6 +146,7 @@ Arguments
 | `--pass-environment`                 | No                         | Pass through all environment variables when spawning the server                               | --no-pass-environment                       |
 | `--allow-origin`                     | No                         | Allowed origins for the SSE server. Can be used multiple times. Default is no CORS allowed.   | --allow-origin "\*"                         |
 | `--expose-header`                    | No                         | Headers added to `Access-Control-Expose-Headers`. Can be used multiple times. Defaults to `mcp-session-id`. | --expose-header Custom-Header              |
+| `--initialization-timeout SECONDS`   | No                         | Deadline for each stdio server initialization; default is unlimited. Cleanup may take additional time. | --initialization-timeout 30                 |
 | `--stateless`                        | No                         | Enable stateless mode for streamable http transports. Default is False                        | --no-stateless                              |
 | `--named-server NAME COMMAND_STRING` | No                         | Defines a named stdio server.                                                                 | --named-server fetch 'uvx mcp-server-fetch' |
 | `--named-server-config FILE_PATH`    | No                         | Path to a JSON file defining named stdio servers.                                             | --named-server-config /path/to/servers.json |
@@ -253,6 +268,9 @@ uv tool install git+https://github.com/sparfenyuk/mcp-proxy
 Starting from version 0.3.2, it's possible to pull and run the corresponding container image.
 Release images are published to GHCR and Docker Hub as multi-platform manifests for `linux/amd64` and `linux/arm64`;
 Docker selects the matching image for the host architecture automatically.
+The runtime image includes `uv` and `uvx`, so Python MCP servers can be launched
+without building a separate image to install these executables. Installing tools
+with dependencies that are not already cached still requires network access.
 
 ```bash
 docker run --rm -t ghcr.io/sparfenyuk/mcp-proxy:v0.12.0 --help
@@ -276,22 +294,27 @@ docker run --rm -t sparfenyuk/mcp-proxy:v0.12.0 --help
 
 ## Extending the container image
 
-You can extend the `mcp-proxy` container image to include additional executables. For instance, `uv` is not included by
-default, but you can create a custom image with it:
+You can extend the `mcp-proxy` container image to include additional executables or
+configure the bundled `uv`. For example, this image restricts `uv` to the system Python:
 
 ```Dockerfile
 # file: mcp-proxy.Dockerfile
 
 FROM ghcr.io/sparfenyuk/mcp-proxy:latest
 
-# Install the 'uv' package
-RUN python3 -m ensurepip && pip install --no-cache-dir uv
-
-ENV PATH="/usr/local/bin:$PATH" \
-    UV_PYTHON_PREFERENCE=only-system
-
-ENTRYPOINT ["catatonit", "--", "mcp-proxy"]
+ENV UV_PYTHON_PREFERENCE=only-system
 ```
+
+To check a locally built image, run the opt-in container tests:
+
+```bash
+docker build -t mcp-proxy:test .
+MCP_PROXY_TEST_IMAGE=mcp-proxy:test uv run --frozen pytest -q tests/test_container_image.py
+```
+
+These tests disable container network access, run a local wheel through `uvx`, and
+launch an MCP server through `uv` to list and call a tool through the proxy.
+Without `MCP_PROXY_TEST_IMAGE`, the container tests are skipped.
 
 ## Docker Compose Setup
 
@@ -375,6 +398,9 @@ stdio client options:
 SSE server options:
   --port PORT           Port to expose an SSE server on. Default is a random port
   --host HOST           Host to expose an SSE server on. Default is 127.0.0.1
+  --initialization-timeout SECONDS
+                        Maximum time to initialize each stdio server. By default, wait indefinitely.
+                        A timeout fails proxy startup and does not limit tool calls. Cleanup may take additional time.
   --stateless, --no-stateless
                         Enable stateless mode for streamable http transports. Default is False
   --sse-port SSE_PORT   (deprecated and ineffective; use --port)

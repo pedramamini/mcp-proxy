@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import typing as t
+from http import HTTPStatus
 from unittest.mock import Mock, patch
 
 import pytest
+from httpx import ASGITransport, AsyncClient
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
 
 from mcp_proxy.__main__ import _create_mcp_settings, _normalize_verify_ssl, _setup_argument_parser
 from mcp_proxy.httpx_client import custom_httpx_client
@@ -19,6 +23,33 @@ if t.TYPE_CHECKING:
 def parser() -> ArgumentParser:
     """Return a fresh argument parser for each test."""
     return _setup_argument_parser()
+
+
+@pytest.mark.parametrize(
+    "origin_flags",
+    [
+        ["--allow-origin", "https://first.example", "https://second.example"],
+        ["--allow-origin", "https://first.example", "--allow-origin", "https://second.example"],
+    ],
+)
+async def test_allow_origin_flags_preserve_all_origins(
+    parser: ArgumentParser, origin_flags: list[str]
+) -> None:
+    """Every origin supplied in one or multiple flags passes CORS preflight."""
+    args = parser.parse_args(["uvx", "mcp-server-fetch", *origin_flags])
+    settings = _create_mcp_settings(args)
+    origins = ["https://first.example", "https://second.example"]
+    assert settings.allow_origins == origins
+
+    app = CORSMiddleware(Starlette(), allow_origins=settings.allow_origins, allow_methods=["GET"])
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for origin in origins:
+            response = await client.options(
+                "/sse",
+                headers={"Origin": origin, "Access-Control-Request-Method": "GET"},
+            )
+            assert response.status_code == HTTPStatus.OK
+            assert response.headers["Access-Control-Allow-Origin"] == origin
 
 
 def test_verify_ssl_cli_false(parser: ArgumentParser) -> None:
@@ -124,3 +155,19 @@ def test_custom_httpx_client_cert_path(mock_async_client: Mock) -> None:
     custom_httpx_client(verify_ssl="/tmp/cert.pem")  # noqa: S108
     kwargs = mock_async_client.call_args.kwargs
     assert kwargs["verify"] == "/tmp/cert.pem"  # noqa: S108
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "invalid"])
+def test_initialization_timeout_rejects_invalid_values(parser: ArgumentParser, value: str) -> None:
+    """Initialization deadlines must be finite and positive."""
+    with pytest.raises(SystemExit):
+        parser.parse_args([f"--initialization-timeout={value}"])
+
+
+@pytest.mark.parametrize("value", [None, "2.5"])
+def test_initialization_timeout_settings(parser: ArgumentParser, value: str | None) -> None:
+    """Propagate the deadline while preserving the unlimited default."""
+    args = parser.parse_args([] if value is None else ["--initialization-timeout", value])
+    assert _create_mcp_settings(args).initialization_timeout == (
+        None if value is None else float(value)
+    )
